@@ -1,0 +1,22 @@
+# Interface graphique
+streamlit==1.39.0
+
+# LangChain core (API 1.x)
+langchain==0.3.7
+langchain-community==0.3.2
+langchain-text-splitters==0.3.1
+
+# Ollama integration
+langchain-ollama==0.2.1
+
+# Vector store
+chromadb==0.5.5
+
+# PDF support (utilisé par PyPDFLoader)
+pypdf==4.2.0
+
+# Docx support
+unstructured[docx]==0.16.11
+
+# Dépendances courantes (sécurité)
+typing-extensions>=4.7.0
