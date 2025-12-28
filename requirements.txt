@@ -3,8 +3,8 @@ streamlit==1.39.0
 
 # LangChain core (API 1.x)
 langchain==0.3.7
-langchain-community==0.3.2
-langchain-text-splitters==0.3.1
+langchain-community==0.3.27
+langchain-text-splitters==0.3.9
 
 # Ollama integration
 langchain-ollama==0.2.1
@@ -13,7 +13,7 @@ langchain-ollama==0.2.1
 chromadb==0.5.5
 
 # PDF support (utilisé par PyPDFLoader)
-pypdf==4.2.0
+pypdf==6.4.0
 
 # Dépendances courantes (sécurité)
 typing-extensions>=4.7.0
