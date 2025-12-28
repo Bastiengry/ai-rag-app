@@ -1,0 +1,21 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+.pytest_cache/
+
+# Données locales (ne pas envoyer dans l'image, on utilise des volumes)
+chroma_db/
+data/
+
+# Docker & Divers
+Dockerfile
+docker-compose.yml
+.DS_Store

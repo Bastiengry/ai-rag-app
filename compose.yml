@@ -1,0 +1,39 @@
+version: '3.8'
+
+networks:
+  rag-net:
+    driver: bridge
+
+volumes:
+  ollama_data:
+
+services:
+  # LLM local Ollama
+  ollama:
+    image: ollama/ollama
+    container_name: ollama-service
+    volumes:
+      - ollama_data:/root/.ollama # Volume nommé pour les modèles (très lourds)
+    networks:
+      - rag-net
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+
+  # Application RAG
+  ai-rag-app:
+    build: .
+    container_name: ai-rag-app
+    ports:
+      - "8501:8501"
+    depends_on:
+      - ollama
+    volumes:
+      - .:/app # Montage du code source (Live Reload)
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+    networks:
+      - rag-net
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
