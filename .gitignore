@@ -2,7 +2,8 @@
 # Ne pas indexer la base de données vectorielle (très lourd et change tout le temps)
 chroma_db/
 # Ne pas indexer les fichiers PDF personnels ou confidentiels
-data/*.pdf
+data/
+data_reference
 
 # --- Docker & Système ---
 .DS_Store

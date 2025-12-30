@@ -30,6 +30,8 @@ services:
       - ollama
     volumes:
       - .:/app # Montage du code source (Live Reload)
+      - ./data:/app/data    # Assure que tes PDF/DOCX sont bien accessibles
+      - ./chroma_db:/app/chroma_db # Évite de perdre l'indexation au redémarrage
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
     networks:
