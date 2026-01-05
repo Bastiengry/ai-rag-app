@@ -1,9 +1,13 @@
 # --- IA & Données ---
 # Ne pas indexer la base de données vectorielle (très lourd et change tout le temps)
 chroma_db/
+# Ne pas indexer la base de données parent_store
+parent_store
+
 # Ne pas indexer les fichiers PDF personnels ou confidentiels
 data/
 data_reference
+
 
 # --- Docker & Système ---
 .DS_Store

@@ -1,15 +1,17 @@
 import streamlit as st
 import os
 import shutil
-import time
-import gc
 import stat
+import hashlib
 
 # Ollama
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 # LangChain (0.3.x – structure optimisée)
+from langchain.retrievers import ParentDocumentRetriever
+from langchain.storage import LocalFileStore
+from langchain.storage._lc_store import create_kv_docstore
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader, UnstructuredWordDocumentLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -26,22 +28,8 @@ st.title("📂 Assistant Local (RAG)")
 # Configuration Ollama
 # --------------------------------------------------
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-
-@st.cache_resource
-def load_models():
-    llm = ChatOllama(
-        model="llama3.2:1b",
-        base_url=OLLAMA_URL,
-        temperature=0.2
-    )
-    embeddings = OllamaEmbeddings(
-        model="nomic-embed-text",
-        base_url=OLLAMA_URL
-    )
-    return llm, embeddings
-
-llm, embeddings = load_models()
-
+DATA_DIR_PATH = "data/"
+PARENT_STORE_DIR = "./parent_store"
 
 # --------------------------------------------------
 # Prompt RAG (IMPORTANT : {multi_doc_context}, {prompt} (et {history}))
@@ -59,7 +47,25 @@ DOCUMENTS DE RÉFÉRENCE :
 
 QA_CHAIN_PROMPT = PromptTemplate.from_template(template)
 
-DATA_DIR_PATH = "data/"
+# Création du stockage local pour les parents (les enfants sont stockés en base Chroma, 
+# mais les parents sont stockés dans des fichiers sur le disque)
+if not os.path.exists(PARENT_STORE_DIR):
+        os.makedirs(PARENT_STORE_DIR)
+
+@st.cache_resource
+def load_models():
+    llm = ChatOllama(
+        model="llama3.2:3b",
+        base_url=OLLAMA_URL,
+        temperature=0.2
+    )
+    embeddings = OllamaEmbeddings(
+        model="nomic-embed-text",
+        base_url=OLLAMA_URL
+    )
+    return llm, embeddings
+
+llm, embeddings = load_models()
 
 # Cette fonction lit le contenu des fichiers du répertoire "data" pour différents formats (PDF, docx...)
 def read_data_dir_files():    
@@ -91,13 +97,39 @@ def prepare_docs_with_metadata(docs):
     new_docs = []
     for doc in docs:
         source_name = os.path.basename(doc.metadata.get("source", "Inconnu"))
-        # On crée un nouveau Document avec metadata “source” explicitement défini
+
+        doc_id = hashlib.md5(doc.metadata["source"].encode()).hexdigest()
+
         new_doc = Document(
             page_content=doc.page_content,
-            metadata={"source": source_name}
+            metadata={
+                "source": source_name,
+                "doc_id": doc_id
+            }
         )
         new_docs.append(new_doc)
     return new_docs
+
+# Nous avons besoin d'un magasin pour stocker les documents "Parents" 
+# car Chroma ne stockera que les "Enfants" (vecteurs)
+if "docstore" not in st.session_state:
+    fs = LocalFileStore(PARENT_STORE_DIR)
+    st.session_state.docstore = create_kv_docstore(fs)
+
+def get_retriever():
+    # 1. Dossier pour stocker les documents Parents sur le disque
+    
+    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000)
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=200)
+
+    # 3. Initialisation du retriever
+    retriever = ParentDocumentRetriever(
+        vectorstore=st.session_state.vectorstore,
+        docstore=st.session_state.docstore,
+        child_splitter=child_splitter,
+        parent_splitter=parent_splitter,
+    )
+    return retriever
 
 # --------------------------------------------------
 # Barre latérale : indexation
@@ -110,85 +142,44 @@ with st.sidebar:
             docs = read_data_dir_files()
 
             if not docs:
-                st.warning("Aucun fichier PDF trouvé dans le dossier /data")
+                st.warning("Aucun fichier trouvé dans le dossier /data")
             else:
                 docs = prepare_docs_with_metadata(docs)
                 
-                # On utilise un 'set' pour éviter les doublons si un fichier a plusieurs pages
-                file_names = sorted(list(set([os.path.basename(d.metadata.get('source', 'Inconnu')) for d in docs])))
-                
-                st.info(f"📄 {len(file_names)} fichiers détectés")
-                with st.expander("Détail des fichiers trouvés"):
-                    for name in file_names:
-                        st.write(f"- {name}")
-                # ---------------------------------------------------------------
-
-                with st.spinner("Création des vecteurs (Embeddings)..."):
-                    splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=1000,
-                        chunk_overlap=100
-                    )
-                    splits = splitter.split_documents(docs)
-
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    # On crée d'abord le vectorstore VIDE ou avec le premier batch
-                    vectorstore = Chroma.from_documents(
-                        documents=splits[:1], # On commence avec juste le premier morceau
-                        embedding=embeddings,
+                # On initialise le vectorstore s'il n'existe pas
+                if "vectorstore" not in st.session_state:
+                    st.session_state.vectorstore = Chroma(
+                        collection_name="split_parents",
+                        embedding_function=embeddings,
                         persist_directory="./chroma_db"
                     )
-
-                    # On ajoute le reste par paquets
-                    batch_size = 10
-                    for i in range(1, len(splits), batch_size):
-                        batch = splits[i:i + batch_size]
-                        vectorstore.add_documents(documents=batch)
-                        
-                        # Mise à jour de la barre
-                        progress = min(i / len(splits), 1.0)
-                        progress_bar.progress(progress)
-                        status_text.text(f"Indexation : {i}/{len(splits)} morceaux...")
-
-                    # Sauvegarde finale de l’index sur disque (obligatoire avant reload)
-                    vectorstore.persist()
-                    
-                    status_text.empty()
-                    progress_bar.empty()
-
-                # IMPORTANT :
-                # On recharge volontairement le vectorstore depuis le disque
-                # pour s'assurer que les nouveaux fichiers indexés sont bien pris en compte
-                # par Streamlit (évite les états mémoire incohérents)
-                st.session_state.vectorstore = Chroma(
-                    persist_directory="./chroma_db",
-                    embedding_function=embeddings
-                )
                 
-                st.success(f"✅ {len(splits)} morceaux indexés avec succès !")
+                retriever = get_retriever()
+                # Cette commande découpe en parents/enfants et indexe tout automatiquement
+                ids = [doc.metadata["doc_id"] for doc in docs]
+                retriever.add_documents(docs, ids=ids)
+                st.session_state.vectorstore.persist()
+                st.success("Indexation Parent-Enfant terminée.")
 
     if st.button("🗑️ Vider la base de données"):
         # On réinitialise la référence dans Streamlit
         if "vectorstore" in st.session_state:
             st.session_state.vectorstore = None
-            gc.collect()
-            time.sleep(2)
 
-        if os.path.exists("./chroma_db"):
-            try:
-                # Sous Windows, parfois il faut forcer la suppression
-                def remove_readonly(func, path, _):
-                    os.chmod(path, stat.S_IWUSR)
-                    func(path)
-                shutil.rmtree("./chroma_db", onerror=remove_readonly)
-                st.success("Base de données supprimée avec succès. Veuillez ré-indexer.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Erreur lors de la suppression : {e}\n"
-                         "Essayez de redémarrer l'application ou vérifiez "
-                         "qu'aucun autre processus n'utilise le dossier.")
-
+        # Supprimer Chroma ET le Parent Store
+        try:
+            for path in ["./chroma_db", "./parent_store"]:
+                if os.path.exists(path):
+                    # Sous Windows, parfois il faut forcer la suppression
+                    def remove_readonly(func, p, _):
+                        os.chmod(p, stat.S_IWUSR)
+                        func(p)
+                    shutil.rmtree(path, onerror=remove_readonly)
+            st.success("Base de données vidée avec succès. Veuillez ré-indexer.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erreur suppression {path}: {e}")
+        
     st.divider() # Petite ligne de séparation visuelle
     st.header("💾 Exportation")
     
@@ -207,10 +198,6 @@ with st.sidebar:
         )
     else:
         st.info("Lancez une discussion pour pouvoir l'exporter.")
-        
-    # --- Expander pour les logs ---
-    with st.expander("📝 Voir les logs/détails techniques", expanded=False):
-        log_placeholder = st.empty()  # Placeholder pour les logs
 
 
 # --------------------------------------------------
@@ -235,97 +222,72 @@ for message in st.session_state.messages:
 # --------------------------------------------------
 # Entrée utilisateur
 # --------------------------------------------------
-if prompt := st.chat_input("Posez votre question..."):
-    # Nettoyage des logs
-    log_placeholder.empty()
-    
-    # Affichage et stockage du message utilisateur
-    st.session_state.messages.append({"role": "user", "content": prompt})
+if prompt := st.chat_input("Posez votre question..."):    
+    try:
+        # Affichage et stockage du message utilisateur
+        st.session_state.messages.append({"role": "user", "content": prompt})
 
-    with st.chat_message("user"):
-        st.markdown(prompt)
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-    if "vectorstore" not in st.session_state:
-        st.error("Veuillez d'abord indexer les documents dans la barre latérale.")
-    else:
-        with st.chat_message("assistant"):
-            # --- ÉTAPE RAG CLASSIQUE ---
-            vectorstore = st.session_state.get("vectorstore")
-            if not vectorstore:
-                st.error("Vectorstore non chargé.")
-                st.stop()
-                
-            log_placeholder.write(f"Nombre de documents dans le vectorstore: {len(vectorstore._collection.get()['ids'])}")
+        if "vectorstore" not in st.session_state:
+            st.error("Veuillez d'abord indexer les documents dans la barre latérale.")
+        else:
+            with st.chat_message("assistant"):
+                # On récupère le retriever
+                retriever = get_retriever()
 
-
-                
-            # Récupère l'historique des questions précédentes dans la conversation en cours
-            last2Mess = st.session_state.messages[-3:-1]
-            history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in last2Mess])
-            
-            augmented_prompt = history + "\nQuestion actuelle: " + prompt
-
-            # Utilise la recherche avec scores
-            docs_and_scores = vectorstore.similarity_search_with_score(
-                augmented_prompt,
-                k=3
-            )
-            
-            for doc, score in docs_and_scores:
-                log_placeholder.write(f"Score: {score} - Source: {doc.metadata.get('source', 'Inconnu')}")
-            
-            # Applique un seuil
-            THRESHOLD = 1.1  # plus bas = plus permissif
-            filtered_docs = [
-                doc for doc, score in docs_and_scores
-                if score <= THRESHOLD  # Chroma = distance (plus petit = meilleur)
-            ]
-            
-            if not filtered_docs:
-                answer = "Désolé, je ne trouve aucune information pertinente dans les documents pour répondre à votre question."
-            else:
-                multi_doc_context = ""
-                
-                log_placeholder.write("--- DEBUG : Documents filtrés ---")
-                for doc in filtered_docs:
-                    log_placeholder.write(doc.metadata.get('source','Inconnu'))
-
-                
-                for idx, doc in enumerate(filtered_docs, 1):
-                    source_name = os.path.basename(doc.metadata.get('source', 'Inconnu'))
-                    multi_doc_context += f"Document {idx} [Source: {source_name}]:\n{doc.page_content}\n\n"
+                # PLUS BESOIN de similarity_search_with_score ni de THRESHOLD
+                # On demande au retriever de trouver les documents les plus pertinents
+                # Il va chercher les petits enfants et nous rendre les gros parents.
+                context_docs = retriever.invoke(prompt)
+                if not context_docs:
+                    st.error("Aucune information trouvée dans les documents.")
+                else:
+                    # Construction du contexte avec les documents parents complets
+                    multi_doc_context = ""
+                    for i, doc in enumerate(context_docs):
+                        source = doc.metadata.get("source", "Inconnu")
+                        multi_doc_context += f"Document {i+1} (Source: {source}):\n{doc.page_content}\n\n"
         
-                # On commence par l'instruction système avec les documents
-                messages = [
-                    SystemMessage(content=QA_CHAIN_PROMPT.format(multi_doc_context=multi_doc_context))
-                ]
+                    with st.expander("📄 Documents utilisés"):
+                        st.text(multi_doc_context[:3000])
 
-                # Ajout de l'historique récent (optionnel mais recommandé pour l'affinement)
-                # On transforme les dictionnaires Streamlit en objets Messages LangChain
-                for msg in st.session_state.messages[-5:-1]: # Les 4 derniers messages
-                    if msg["role"] == "user":
-                        messages.append(HumanMessage(content=msg["content"]))
-                    else:
-                        messages.append(AIMessage(content=msg["content"]))
+                    # On commence par l'instruction système avec les documents
+                    messages = [
+                        SystemMessage(content=QA_CHAIN_PROMPT.format(multi_doc_context=multi_doc_context))
+                    ]
 
-                # 4. Ajout de la question actuelle
-                messages.append(HumanMessage(content=prompt))
-                
-                with st.spinner("L'IA analyse les documents..."):
-                    try:
-                        placeholder = st.empty()
-                        full_answer = ""
-                        
-                        # Utilisation du stream pour un affichage fluide
-                        for chunk in llm.stream(messages):
-                            full_answer += chunk.content # .content est nécessaire avec ChatOllama
-                            placeholder.markdown(full_answer + "▌")
-                        
-                        placeholder.markdown(full_answer)
-                        answer = full_answer
-                    except Exception as e:
-                        st.error(f"Erreur Ollama : {e}")
-                        answer = "Erreur lors de la génération."
+                    # Ajout de l'historique récent (optionnel mais recommandé pour l'affinement)
+                    # On transforme les dictionnaires Streamlit en objets Messages LangChain
+                    for msg in st.session_state.messages[-5:-1]: # Les 4 derniers messages
+                        if msg["role"] == "user":
+                            messages.append(HumanMessage(content=msg["content"]))
+                        else:
+                            messages.append(AIMessage(content=msg["content"]))
 
-            # On enregistre la réponse finale dans l'historique
-            st.session_state.messages.append({"role": "assistant", "content": answer})
+                    # Ajout de la question actuelle
+                    messages.append(HumanMessage(content=prompt))
+                    
+                    answer = ""
+                    with st.spinner("L'IA analyse les documents..."):
+                        try:
+                            placeholder = st.empty()
+                            full_answer = ""
+                            
+                            # Utilisation du stream pour un affichage fluide
+                            for chunk in llm.stream(messages):
+                                full_answer += chunk.content # .content est nécessaire avec ChatOllama
+                                placeholder.markdown(full_answer + "▌")
+                            
+                            placeholder.markdown(full_answer)
+                            answer = full_answer
+                        except Exception as e:
+                            st.error(f"Erreur Ollama : {e}")
+                            answer = "Erreur lors de la génération."
+
+                    # On enregistre la réponse finale dans l'historique
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
+
+    except Exception as e:
+        st.error(f"Erreur: {e}")
