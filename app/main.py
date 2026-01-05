@@ -6,7 +6,8 @@ import gc
 import stat
 
 # Ollama
-from langchain_ollama import OllamaLLM, OllamaEmbeddings
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 # LangChain (0.3.x – structure optimisée)
 from langchain_community.vectorstores import Chroma
@@ -28,7 +29,7 @@ OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 
 @st.cache_resource
 def load_models():
-    llm = OllamaLLM(
+    llm = ChatOllama(
         model="llama3.2:1b",
         base_url=OLLAMA_URL,
         temperature=0.2
@@ -46,23 +47,13 @@ llm, embeddings = load_models()
 # Prompt RAG (IMPORTANT : {multi_doc_context}, {prompt} (et {history}))
 # --------------------------------------------------
 template = """
-### Instructions :
-Réponds à la question **uniquement** en utilisant les documents et l'historique fournis ci-dessous.
-Ne réponds **jamais** avec des connaissances générales ou externes.
-Si les documents ne contiennent **aucune** information pertinente, réponds simplement : "Aucune information pertinente trouvée dans les documents."
-Cite toujours la source.
+Tu es un assistant expert en documentation d'entreprise. 
+Réponds UNIQUEMENT en utilisant les documents fournis. 
+Si l'information n'est pas présente, dis que tu ne sais pas.
+Cite toujours la source du document (ex: [Source: fichier.pdf]).
 
----
-HISTORIQUE DE LA CONVERSATION :
-{history}
-
----
-DOCUMENTS :
+DOCUMENTS DE RÉFÉRENCE :
 {multi_doc_context}
-
-Question: {prompt}
-Réponse (sois précis, mais n'hésite pas à reformuler ou compléter si nécessaire) :
-
 """
 
 
@@ -304,43 +295,37 @@ if prompt := st.chat_input("Posez votre question..."):
                     source_name = os.path.basename(doc.metadata.get('source', 'Inconnu'))
                     multi_doc_context += f"Document {idx} [Source: {source_name}]:\n{doc.page_content}\n\n"
         
-                # À ajouter temporairement pour déboguer
-                log_placeholder.write(f"Contexte envoyé à l'IA : {multi_doc_context}")
+                # On commence par l'instruction système avec les documents
+                messages = [
+                    SystemMessage(content=QA_CHAIN_PROMPT.format(multi_doc_context=multi_doc_context))
+                ]
 
-                # QA chain llm enrichie avec les documents, le prompt et l'historique des questions
-                qa_chain = QA_CHAIN_PROMPT.format(
-                    multi_doc_context=multi_doc_context,
-                    prompt=prompt,
-                    history=history
-                )
-        
-                # Normalisation des apostrophes
-                multi_doc_context = multi_doc_context.replace("’", "'")
-                qa_chain = qa_chain.replace("’", "'")
+                # Ajout de l'historique récent (optionnel mais recommandé pour l'affinement)
+                # On transforme les dictionnaires Streamlit en objets Messages LangChain
+                for msg in st.session_state.messages[-5:-1]: # Les 4 derniers messages
+                    if msg["role"] == "user":
+                        messages.append(HumanMessage(content=msg["content"]))
+                    else:
+                        messages.append(AIMessage(content=msg["content"]))
+
+                # 4. Ajout de la question actuelle
+                messages.append(HumanMessage(content=prompt))
                 
-                
-                log_placeholder.write("--- DEBUG : qa_chain ---")
-                log_placeholder.code(qa_chain, language="python")
-                
-                with st.spinner("L'IA réfléchit..."):
+                with st.spinner("L'IA analyse les documents..."):
                     try:
-                        answer = llm.invoke(qa_chain)
-                        st.markdown(answer)
+                        placeholder = st.empty()
+                        full_answer = ""
+                        
+                        # Utilisation du stream pour un affichage fluide
+                        for chunk in llm.stream(messages):
+                            full_answer += chunk.content # .content est nécessaire avec ChatOllama
+                            placeholder.markdown(full_answer + "▌")
+                        
+                        placeholder.markdown(full_answer)
+                        answer = full_answer
                     except Exception as e:
                         st.error(f"Erreur Ollama : {e}")
                         answer = "Erreur lors de la génération."
-
-                # Appel au LLM avec le contexte déjà formaté
-                # On utilise directement le LLM + Prompt car on a déjà géré le contexte
-                # (Plus simple et plus de contrôle que create_retrieval_chain ici)
-                # UTILISATION DU STREAMING (Pour voir la réponse s'afficher en direct et éviter les timeouts)
-                #full_answer = ""
-                #placeholder = st.empty()
-                #for chunk in llm.stream(full_prompt):
-                #    full_answer += chunk
-                #    placeholder.markdown(full_answer + "▌")
-                #placeholder.markdown(full_answer) # Nettoyage du curseur final
-                #answer = full_answer
 
             # On enregistre la réponse finale dans l'historique
             st.session_state.messages.append({"role": "assistant", "content": answer})
