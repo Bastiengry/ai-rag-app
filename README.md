@@ -30,3 +30,7 @@ docker compose down
 
 - Supprimer le répertoire chroma_db
 - Supprimer le répertoire parent_store
+
+# Ouvrir l'application dans un navigateur
+
+L'URL de l'application est : http://localhost:8501/
