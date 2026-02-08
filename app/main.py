@@ -31,21 +31,6 @@ OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 DATA_DIR_PATH = "data/"
 PARENT_STORE_DIR = "./parent_store"
 
-# --------------------------------------------------
-# Prompt RAG (IMPORTANT : {multi_doc_context}, {prompt} (et {history}))
-# --------------------------------------------------
-template = """
-Tu es un assistant expert en documentation d'entreprise. 
-Réponds UNIQUEMENT en utilisant les documents fournis. 
-Si l'information n'est pas présente, dis que tu ne sais pas.
-Cite toujours la source du document (ex: [Source: fichier.pdf]).
-
-DOCUMENTS DE RÉFÉRENCE :
-{multi_doc_context}
-"""
-
-
-QA_CHAIN_PROMPT = PromptTemplate.from_template(template)
 
 # Création du stockage local pour les parents (les enfants sont stockés en base Chroma, 
 # mais les parents sont stockés dans des fichiers sur le disque)
@@ -57,7 +42,7 @@ def load_models():
     llm = ChatOllama(
         model="llama3.2:3b",
         base_url=OLLAMA_URL,
-        temperature=0.2
+        temperature=0.4
     )
     embeddings = OllamaEmbeddings(
         model="nomic-embed-text",
@@ -93,23 +78,6 @@ def format_docs_with_sources(docs):
         formatted.append(content)
     return "\n\n---\n\n".join(formatted)
 
-def prepare_docs_with_metadata(docs):
-    new_docs = []
-    for doc in docs:
-        source_name = os.path.basename(doc.metadata.get("source", "Inconnu"))
-
-        doc_id = hashlib.md5(doc.metadata["source"].encode()).hexdigest()
-
-        new_doc = Document(
-            page_content=doc.page_content,
-            metadata={
-                "source": source_name,
-                "doc_id": doc_id
-            }
-        )
-        new_docs.append(new_doc)
-    return new_docs
-
 # Nous avons besoin d'un magasin pour stocker les documents "Parents" 
 # car Chroma ne stockera que les "Enfants" (vecteurs)
 if "docstore" not in st.session_state:
@@ -117,10 +85,17 @@ if "docstore" not in st.session_state:
     st.session_state.docstore = create_kv_docstore(fs)
 
 def get_retriever():
-    # 1. Dossier pour stocker les documents Parents sur le disque
-    
+    # Sécurité : Si le vectorstore a été vidé ou n'est pas chargé
+    if "vectorstore" not in st.session_state or st.session_state.vectorstore is None:
+        st.session_state.vectorstore = Chroma(
+            collection_name="split_parents",
+            embedding_function=embeddings,
+            persist_directory="./chroma_db"
+        )
+
+    # 1. Dossier pour stocker les documents Parents sur le disque    
     parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000)
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=200)
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=400)
 
     # 3. Initialisation du retriever
     retriever = ParentDocumentRetriever(
@@ -143,9 +118,7 @@ with st.sidebar:
 
             if not docs:
                 st.warning("Aucun fichier trouvé dans le dossier /data")
-            else:
-                docs = prepare_docs_with_metadata(docs)
-                
+            else:                
                 # On initialise le vectorstore s'il n'existe pas
                 if "vectorstore" not in st.session_state:
                     st.session_state.vectorstore = Chroma(
@@ -155,30 +128,21 @@ with st.sidebar:
                     )
                 
                 retriever = get_retriever()
-                # Cette commande découpe en parents/enfants et indexe tout automatiquement
-                ids = [doc.metadata["doc_id"] for doc in docs]
-                retriever.add_documents(docs, ids=ids)
+                retriever.add_documents(docs)
                 st.session_state.vectorstore.persist()
                 st.success("Indexation Parent-Enfant terminée.")
 
     if st.button("🗑️ Vider la base de données"):
-        # On réinitialise la référence dans Streamlit
-        if "vectorstore" in st.session_state:
-            st.session_state.vectorstore = None
-
-        # Supprimer Chroma ET le Parent Store
-        try:
-            for path in ["./chroma_db", "./parent_store"]:
-                if os.path.exists(path):
-                    # Sous Windows, parfois il faut forcer la suppression
-                    def remove_readonly(func, p, _):
-                        os.chmod(p, stat.S_IWUSR)
-                        func(p)
-                    shutil.rmtree(path, onerror=remove_readonly)
-            st.success("Base de données vidée avec succès. Veuillez ré-indexer.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Erreur suppression {path}: {e}")
+        if "vectorstore" in st.session_state and st.session_state.vectorstore is not None:
+            try:
+                # On demande à Chroma de supprimer TOUTE la collection en interne
+                st.session_state.vectorstore.delete_collection()
+                # On réinitialise la variable
+                st.session_state.vectorstore = None
+                st.success("La collection a été vidée proprement.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Erreur lors du vidage : {e}")
         
     st.divider() # Petite ligne de séparation visuelle
     st.header("💾 Exportation")
@@ -205,6 +169,7 @@ with st.sidebar:
 # --------------------------------------------------
 if "vectorstore" not in st.session_state and os.path.exists("./chroma_db"):
     st.session_state.vectorstore = Chroma(
+        collection_name="split_parents",
         persist_directory="./chroma_db",
         embedding_function=embeddings
     )
@@ -254,8 +219,16 @@ if prompt := st.chat_input("Posez votre question..."):
                         st.text(multi_doc_context[:3000])
 
                     # On commence par l'instruction système avec les documents
+                    prompt_template = (
+                        "Tu es un assistant expert.\n"
+                        "Réponds UNIQUEMENT en utilisant le contexte fourni ci-dessous.\n"
+                        "Sois direct et précis. Si le document affirme quelque chose, même brièvement, "
+                        "utilise cette information pour répondre à l'utilisateur.\n\n"
+                        f"CONTEXTE : {multi_doc_context}"
+                    )
+
                     messages = [
-                        SystemMessage(content=QA_CHAIN_PROMPT.format(multi_doc_context=multi_doc_context))
+                        SystemMessage(content=prompt_template)
                     ]
 
                     # Ajout de l'historique récent (optionnel mais recommandé pour l'affinement)
