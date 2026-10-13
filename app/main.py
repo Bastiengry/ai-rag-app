@@ -6,15 +6,17 @@ import hashlib
 
 # Ollama
 from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 # LangChain
 from langchain.retrievers import ParentDocumentRetriever
 from langchain.storage import LocalFileStore
 from langchain.storage._lc_store import create_kv_docstore
-from langchain_chroma import Chroma
+from langchain_chroma import Chroma  # pip install langchain-chroma
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredWordDocumentLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# Agent LangGraph (fichier agent.py, dans le même dossier)
+from agent import build_agent, stream_agent
 
 # --------------------------------------------------
 # Configuration
@@ -43,11 +45,19 @@ def load_models():
         temperature=0.4,
         num_ctx=8192,  # fenêtre de contexte élargie : évite la troncature silencieuse
     )
+    # Même modèle et même num_ctx (pas de rechargement), mais sortie JSON pour le routeur et le vérificateur
+    llm_json = ChatOllama(
+        model="llama3.2:3b",
+        base_url=OLLAMA_URL,
+        temperature=0,
+        num_ctx=8192,
+        format="json",
+    )
     embeddings = OllamaEmbeddings(model="nomic-embed-text", base_url=OLLAMA_URL)
-    return llm, embeddings
+    return llm, llm_json, embeddings
 
 
-llm, embeddings = load_models()
+llm, llm_json, embeddings = load_models()
 
 
 # --------------------------------------------------
@@ -195,72 +205,38 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-SYSTEM_PROMPT = (
-    "Tu es un assistant expert.\n"
-    "Réponds UNIQUEMENT en utilisant le contexte fourni ci-dessous.\n"
-    "Sois direct et précis. Si le document affirme quelque chose, même brièvement, "
-    "utilise cette information.\n"
-    "Si la réponse ne se trouve pas dans le contexte, dis clairement que tu ne trouves "
-    "pas l'information dans les documents. N'invente rien.\n\n"
-    "CONTEXTE :\n{context}"
-)
-
 # --------------------------------------------------
-# Entrée utilisateur
+# Entrée utilisateur → agent
 # --------------------------------------------------
 if prompt := st.chat_input("Posez votre question..."):
-    try:
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-        if not load_registry():
-            st.error("Veuillez d'abord indexer les documents dans la barre latérale.")
-        else:
-            with st.chat_message("assistant"):
-                context_docs = get_retriever().invoke(prompt)
+    if not load_registry():
+        st.error("Veuillez d'abord indexer les documents dans la barre latérale.")
+    else:
+        with st.chat_message("assistant"):
+            history = st.session_state.messages[-5:-1]  # 4 derniers messages avant la question
+            graph = build_agent(llm, llm_json, get_retriever())
+            answer, context = "", ""
+            try:
+                with st.status("L'agent réfléchit...", expanded=True) as status:
+                    for node, delta in stream_agent(graph, prompt, history):
+                        if delta.get("log"):
+                            st.write(delta["log"])
+                        if delta.get("context"):
+                            context = delta["context"]
+                        if delta.get("answer"):
+                            answer = delta["answer"]
+                    status.update(label="Terminé", state="complete", expanded=False)
 
-                if not context_docs:
-                    st.error("Aucune information trouvée dans les documents.")
-                else:
-                    multi_doc_context = ""
-                    sources = []
-                    for i, doc in enumerate(context_docs):
-                        source = os.path.basename(doc.metadata.get("source", "Inconnu"))
-                        if source not in sources:
-                            sources.append(source)
-                        multi_doc_context += (
-                            f"Document {i+1} (Source: {source}):\n{doc.page_content}\n\n"
-                        )
-
+                if context:
                     with st.expander("📄 Documents utilisés"):
-                        st.text(multi_doc_context[:3000])
+                        st.text(context[:3000])
+                st.markdown(answer or "Je n'ai pas pu produire de réponse.")
+            except Exception as e:
+                answer = f"Erreur de l'agent : {e}"
+                st.error(answer)
 
-                    messages = [SystemMessage(content=SYSTEM_PROMPT.format(context=multi_doc_context))]
-
-                    # Historique récent (4 derniers messages avant la question actuelle)
-                    for msg in st.session_state.messages[-5:-1]:
-                        cls = HumanMessage if msg["role"] == "user" else AIMessage
-                        messages.append(cls(content=msg["content"]))
-                    messages.append(HumanMessage(content=prompt))
-
-                    answer = ""
-                    with st.spinner("L'IA analyse les documents..."):
-                        try:
-                            placeholder = st.empty()
-                            full_answer = ""
-                            for chunk in llm.stream(messages):
-                                full_answer += chunk.content
-                                placeholder.markdown(full_answer + "▌")
-
-                            full_answer += f"\n\n📚 *Sources : {', '.join(sources)}*"
-                            placeholder.markdown(full_answer)
-                            answer = full_answer
-                        except Exception as e:
-                            st.error(f"Erreur Ollama : {e}")
-                            answer = "Erreur lors de la génération."
-
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
-
-    except Exception as e:
-        st.error(f"Erreur: {e}")
+            st.session_state.messages.append({"role": "assistant", "content": answer})

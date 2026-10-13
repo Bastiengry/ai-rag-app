@@ -6,6 +6,7 @@ langchain==0.3.7
 langchain-community==0.3.2
 langchain-text-splitters==0.3.1
 
+
 # Ollama
 langchain-ollama==0.2.1
 
@@ -20,3 +21,5 @@ pypdf==4.2.0
 docx2txt==0.8
 
 typing-extensions>=4.7.0
+
+langgraph>=0.2.50,<0.3
