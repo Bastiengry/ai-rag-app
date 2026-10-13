@@ -1,5 +1,3 @@
-version: '3.8'
-
 networks:
   rag-net:
     driver: bridge
@@ -16,8 +14,9 @@ services:
       - ollama_data:/root/.ollama # Volume nommé pour les modèles (très lourds)
     networks:
       - rag-net
-    ports:
-      - "11434:11434"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     restart: unless-stopped
 
   # Application RAG

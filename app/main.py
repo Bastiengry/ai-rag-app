@@ -1,178 +1,189 @@
 import streamlit as st
 import os
+import json
 import shutil
-import stat
 import hashlib
 
 # Ollama
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
-# LangChain (0.3.x – structure optimisée)
+# LangChain
 from langchain.retrievers import ParentDocumentRetriever
 from langchain.storage import LocalFileStore
 from langchain.storage._lc_store import create_kv_docstore
-from langchain_community.vectorstores import Chroma
-from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader, UnstructuredWordDocumentLoader
+from langchain_chroma import Chroma
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredWordDocumentLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain.prompts import PromptTemplate
-from langchain.schema import Document
 
 # --------------------------------------------------
-# Configuration Streamlit
+# Configuration
 # --------------------------------------------------
 st.set_page_config(page_title="Mon IA Offline (RAG)", layout="wide")
 st.title("📂 Assistant Local (RAG)")
 
-# --------------------------------------------------
-# Configuration Ollama
-# --------------------------------------------------
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 DATA_DIR_PATH = "data/"
 PARENT_STORE_DIR = "./parent_store"
+CHROMA_DIR = "./chroma_db"
+COLLECTION_NAME = "split_parents"
+REGISTRY_PATH = "./index_registry.json"  # {chemin_fichier: hash_sha256}
 
+LOADERS = {
+    ".pdf": PyPDFLoader,
+    ".docx": UnstructuredWordDocumentLoader,
+}
 
-# Création du stockage local pour les parents (les enfants sont stockés en base Chroma, 
-# mais les parents sont stockés dans des fichiers sur le disque)
-if not os.path.exists(PARENT_STORE_DIR):
-        os.makedirs(PARENT_STORE_DIR)
 
 @st.cache_resource
 def load_models():
     llm = ChatOllama(
         model="llama3.2:3b",
         base_url=OLLAMA_URL,
-        temperature=0.4
+        temperature=0.4,
+        num_ctx=8192,  # fenêtre de contexte élargie : évite la troncature silencieuse
     )
-    embeddings = OllamaEmbeddings(
-        model="nomic-embed-text",
-        base_url=OLLAMA_URL
-    )
+    embeddings = OllamaEmbeddings(model="nomic-embed-text", base_url=OLLAMA_URL)
     return llm, embeddings
+
 
 llm, embeddings = load_models()
 
-# Cette fonction lit le contenu des fichiers du répertoire "data" pour différents formats (PDF, docx...)
-def read_data_dir_files():    
-    # Chargement des PDF
-    pdf_loader = DirectoryLoader(DATA_DIR_PATH, glob="**/*.pdf", loader_cls=PyPDFLoader)
-    
-    # Chargement des DOCX
-    docx_loader = DirectoryLoader(DATA_DIR_PATH, glob="**/*.docx", loader_cls=UnstructuredWordDocumentLoader)
-    
-    # On combine les documents des deux sources
-    pdf_docs = pdf_loader.load()
-    docx_docs = docx_loader.load()
-    
-    docs = pdf_docs + docx_docs
-    
-    
-    return docs
-
-# Cette fonction va formater chaque morceau de texte pour inclure sa source
-def format_docs_with_sources(docs):
-    formatted = []
-    for doc in docs:
-        source_name = os.path.basename(doc.metadata.get('source', 'Inconnu'))
-        content = f"[Source: {source_name}]\n{doc.page_content}"
-        formatted.append(content)
-    return "\n\n---\n\n".join(formatted)
-
-# Nous avons besoin d'un magasin pour stocker les documents "Parents" 
-# car Chroma ne stockera que les "Enfants" (vecteurs)
-if "docstore" not in st.session_state:
-    fs = LocalFileStore(PARENT_STORE_DIR)
-    st.session_state.docstore = create_kv_docstore(fs)
-
-def get_retriever():
-    # Sécurité : Si le vectorstore a été vidé ou n'est pas chargé
-    if "vectorstore" not in st.session_state or st.session_state.vectorstore is None:
-        st.session_state.vectorstore = Chroma(
-            collection_name="split_parents",
-            embedding_function=embeddings,
-            persist_directory="./chroma_db"
-        )
-
-    # 1. Dossier pour stocker les documents Parents sur le disque    
-    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000)
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=400)
-
-    # 3. Initialisation du retriever
-    retriever = ParentDocumentRetriever(
-        vectorstore=st.session_state.vectorstore,
-        docstore=st.session_state.docstore,
-        child_splitter=child_splitter,
-        parent_splitter=parent_splitter,
-    )
-    return retriever
 
 # --------------------------------------------------
-# Barre latérale : indexation
+# Registre d'indexation (déduplication par hash de fichier)
+# --------------------------------------------------
+def load_registry():
+    if os.path.exists(REGISTRY_PATH):
+        with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_registry(registry):
+    with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
+        json.dump(registry, f, indent=2)
+
+
+def file_hash(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(65536), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def list_data_files():
+    files = []
+    for root, _, names in os.walk(DATA_DIR_PATH):
+        for name in names:
+            if os.path.splitext(name)[1].lower() in LOADERS:
+                files.append(os.path.join(root, name))
+    return files
+
+
+# --------------------------------------------------
+# Stockage : parents (disque) + enfants (Chroma)
+# --------------------------------------------------
+def get_docstore():
+    os.makedirs(PARENT_STORE_DIR, exist_ok=True)
+    if "docstore" not in st.session_state:
+        st.session_state.docstore = create_kv_docstore(LocalFileStore(PARENT_STORE_DIR))
+    return st.session_state.docstore
+
+
+def get_vectorstore():
+    if st.session_state.get("vectorstore") is None:
+        st.session_state.vectorstore = Chroma(
+            collection_name=COLLECTION_NAME,
+            embedding_function=embeddings,
+            persist_directory=CHROMA_DIR,
+        )
+    return st.session_state.vectorstore
+
+
+def get_retriever():
+    return ParentDocumentRetriever(
+        vectorstore=get_vectorstore(),
+        docstore=get_docstore(),
+        child_splitter=RecursiveCharacterTextSplitter(chunk_size=400),
+        parent_splitter=RecursiveCharacterTextSplitter(chunk_size=2000),
+    )
+
+
+def index_new_files():
+    """Indexe uniquement les fichiers nouveaux ou modifiés. Retourne (nb_indexés, nb_ignorés)."""
+    registry = load_registry()
+    retriever = get_retriever()
+    indexed, skipped = 0, 0
+
+    for path in list_data_files():
+        h = file_hash(path)
+        if registry.get(path) == h:
+            skipped += 1
+            continue
+        loader_cls = LOADERS[os.path.splitext(path)[1].lower()]
+        docs = loader_cls(path).load()
+        if docs:
+            retriever.add_documents(docs)
+            registry[path] = h
+            indexed += 1
+
+    save_registry(registry)
+    return indexed, skipped
+
+
+def reset_everything():
+    """Vide Chroma, les documents parents ET le registre."""
+    get_vectorstore().delete_collection()
+    st.session_state.vectorstore = None
+
+    shutil.rmtree(PARENT_STORE_DIR, ignore_errors=True)
+    st.session_state.pop("docstore", None)
+
+    if os.path.exists(REGISTRY_PATH):
+        os.remove(REGISTRY_PATH)
+
+
+# --------------------------------------------------
+# Barre latérale
 # --------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    if st.button("📥 Indexer les fichiers du dossier \"data\""):
+    if st.button('📥 Indexer les fichiers du dossier "data"'):
         with st.spinner("Indexation en cours..."):
-            docs = read_data_dir_files()
-
-            if not docs:
-                st.warning("Aucun fichier trouvé dans le dossier /data")
-            else:                
-                # On initialise le vectorstore s'il n'existe pas
-                if "vectorstore" not in st.session_state:
-                    st.session_state.vectorstore = Chroma(
-                        collection_name="split_parents",
-                        embedding_function=embeddings,
-                        persist_directory="./chroma_db"
-                    )
-                
-                retriever = get_retriever()
-                retriever.add_documents(docs)
-                st.session_state.vectorstore.persist()
-                st.success("Indexation Parent-Enfant terminée.")
+            if not list_data_files():
+                st.warning("Aucun fichier PDF/DOCX trouvé dans le dossier /data")
+            else:
+                indexed, skipped = index_new_files()
+                st.success(f"{indexed} fichier(s) indexé(s), {skipped} déjà à jour.")
 
     if st.button("🗑️ Vider la base de données"):
-        if "vectorstore" in st.session_state and st.session_state.vectorstore is not None:
-            try:
-                # On demande à Chroma de supprimer TOUTE la collection en interne
-                st.session_state.vectorstore.delete_collection()
-                # On réinitialise la variable
-                st.session_state.vectorstore = None
-                st.success("La collection a été vidée proprement.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Erreur lors du vidage : {e}")
-        
-    st.divider() # Petite ligne de séparation visuelle
+        try:
+            reset_everything()
+            st.success("Base vidée (vecteurs, parents et registre).")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erreur lors du vidage : {e}")
+
+    st.divider()
     st.header("💾 Exportation")
-    
-    if "messages" in st.session_state and st.session_state.messages:
-        # On prépare le contenu du fichier texte
+
+    if st.session_state.get("messages"):
         chat_export = ""
         for msg in st.session_state.messages:
             role = "Utilisateur" if msg["role"] == "user" else "Assistant"
             chat_export += f"{role}: {msg['content']}\n\n"
-        
+
         st.download_button(
             label="📥 Télécharger la conversation",
             data=chat_export,
             file_name="conversation_ia.txt",
-            mime="text/plain"
+            mime="text/plain",
         )
     else:
         st.info("Lancez une discussion pour pouvoir l'exporter.")
-
-
-# --------------------------------------------------
-# Chargement du vectorstore existant (si présent)
-# --------------------------------------------------
-if "vectorstore" not in st.session_state and os.path.exists("./chroma_db"):
-    st.session_state.vectorstore = Chroma(
-        collection_name="split_parents",
-        persist_directory="./chroma_db",
-        embedding_function=embeddings
-    )
 
 # --------------------------------------------------
 # Interface de chat
@@ -184,82 +195,71 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
+SYSTEM_PROMPT = (
+    "Tu es un assistant expert.\n"
+    "Réponds UNIQUEMENT en utilisant le contexte fourni ci-dessous.\n"
+    "Sois direct et précis. Si le document affirme quelque chose, même brièvement, "
+    "utilise cette information.\n"
+    "Si la réponse ne se trouve pas dans le contexte, dis clairement que tu ne trouves "
+    "pas l'information dans les documents. N'invente rien.\n\n"
+    "CONTEXTE :\n{context}"
+)
+
 # --------------------------------------------------
 # Entrée utilisateur
 # --------------------------------------------------
-if prompt := st.chat_input("Posez votre question..."):    
+if prompt := st.chat_input("Posez votre question..."):
     try:
-        # Affichage et stockage du message utilisateur
         st.session_state.messages.append({"role": "user", "content": prompt})
-
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        if "vectorstore" not in st.session_state:
+        if not load_registry():
             st.error("Veuillez d'abord indexer les documents dans la barre latérale.")
         else:
             with st.chat_message("assistant"):
-                # On récupère le retriever
-                retriever = get_retriever()
+                context_docs = get_retriever().invoke(prompt)
 
-                # PLUS BESOIN de similarity_search_with_score ni de THRESHOLD
-                # On demande au retriever de trouver les documents les plus pertinents
-                # Il va chercher les petits enfants et nous rendre les gros parents.
-                context_docs = retriever.invoke(prompt)
                 if not context_docs:
                     st.error("Aucune information trouvée dans les documents.")
                 else:
-                    # Construction du contexte avec les documents parents complets
                     multi_doc_context = ""
+                    sources = []
                     for i, doc in enumerate(context_docs):
-                        source = doc.metadata.get("source", "Inconnu")
-                        multi_doc_context += f"Document {i+1} (Source: {source}):\n{doc.page_content}\n\n"
-        
+                        source = os.path.basename(doc.metadata.get("source", "Inconnu"))
+                        if source not in sources:
+                            sources.append(source)
+                        multi_doc_context += (
+                            f"Document {i+1} (Source: {source}):\n{doc.page_content}\n\n"
+                        )
+
                     with st.expander("📄 Documents utilisés"):
                         st.text(multi_doc_context[:3000])
 
-                    # On commence par l'instruction système avec les documents
-                    prompt_template = (
-                        "Tu es un assistant expert.\n"
-                        "Réponds UNIQUEMENT en utilisant le contexte fourni ci-dessous.\n"
-                        "Sois direct et précis. Si le document affirme quelque chose, même brièvement, "
-                        "utilise cette information pour répondre à l'utilisateur.\n\n"
-                        f"CONTEXTE : {multi_doc_context}"
-                    )
+                    messages = [SystemMessage(content=SYSTEM_PROMPT.format(context=multi_doc_context))]
 
-                    messages = [
-                        SystemMessage(content=prompt_template)
-                    ]
-
-                    # Ajout de l'historique récent (optionnel mais recommandé pour l'affinement)
-                    # On transforme les dictionnaires Streamlit en objets Messages LangChain
-                    for msg in st.session_state.messages[-5:-1]: # Les 4 derniers messages
-                        if msg["role"] == "user":
-                            messages.append(HumanMessage(content=msg["content"]))
-                        else:
-                            messages.append(AIMessage(content=msg["content"]))
-
-                    # Ajout de la question actuelle
+                    # Historique récent (4 derniers messages avant la question actuelle)
+                    for msg in st.session_state.messages[-5:-1]:
+                        cls = HumanMessage if msg["role"] == "user" else AIMessage
+                        messages.append(cls(content=msg["content"]))
                     messages.append(HumanMessage(content=prompt))
-                    
+
                     answer = ""
                     with st.spinner("L'IA analyse les documents..."):
                         try:
                             placeholder = st.empty()
                             full_answer = ""
-                            
-                            # Utilisation du stream pour un affichage fluide
                             for chunk in llm.stream(messages):
-                                full_answer += chunk.content # .content est nécessaire avec ChatOllama
+                                full_answer += chunk.content
                                 placeholder.markdown(full_answer + "▌")
-                            
+
+                            full_answer += f"\n\n📚 *Sources : {', '.join(sources)}*"
                             placeholder.markdown(full_answer)
                             answer = full_answer
                         except Exception as e:
                             st.error(f"Erreur Ollama : {e}")
                             answer = "Erreur lors de la génération."
 
-                    # On enregistre la réponse finale dans l'historique
                     st.session_state.messages.append({"role": "assistant", "content": answer})
 
     except Exception as e:
